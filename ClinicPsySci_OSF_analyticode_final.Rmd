@@ -1,0 +1,715 @@
+---
+title: "MIDUS Daily Diary RE-EM Trees"
+output: html_document
+date: "2026-10-16"
+---
+
+# Load packages
+
+```{r}
+pacman::p_load(ggplot2, tidyr, dplyr, REEMtree)
+```
+
+# RE-EM Tree model
+
+## Aggregated model
+
+### Set up nested blocked CV
+
+```{r}
+create_blocked_folds <- function(data, id_col, k) {
+  ids <- unique(data[[id_col]])
+  folds <- caret::createFolds(ids, k = k, list = TRUE) 
+  id_folds <- lapply(folds, function(indices) ids[indices]) 
+  lapply(id_folds, function(ids_in_fold) { 
+  which(data[[id_col]] %in% as.numeric(ids_in_fold))  
+})
+}
+
+# Create blocked folds for individuals
+set.seed(123)
+blocked_folds = create_blocked_folds(treedf_agg, id_col="pid", k = 5)
+```
+
+
+
+### Positive affect 
+
+```{r}
+# Inner loop Function
+inner_loop <- function(train_data){
+
+  grid <- expand.grid(
+    cp = 0.001,
+    minsplit = c(50,100, 200)
+  )
+
+  inner_folds <- create_blocked_folds(train_data, id_col="pid", k=5)
+
+  tune_results <- lapply(seq_len(nrow(grid)), function(i){
+
+    params <- grid[i,]
+
+    fold_results <- lapply(seq_along(inner_folds), function(fold){
+
+      valid_idx <- inner_folds[[fold]]
+      train_idx <- setdiff(seq_len(nrow(train_data)), valid_idx)
+
+      inner_train <- train_data[train_idx,]
+      inner_valid <- train_data[valid_idx,]
+
+      model <- REEMtree(
+        DDpa ~ DDanystr + DDanypos + DDanyemospt + DDphyact +
+          DDslphour + DDanyphysymp +
+          dep + age + race_2g + collegegrad + female + DDwknd,
+        random = ~1|pid,
+        data = inner_train,
+        tree.control = rpart.control(cp=params$cp,
+                                     minsplit=params$minsplit),
+        correlation = corAR1(form = ~ DDday | pid)
+      )
+
+      pred <- predict(model,
+                      newdata=inner_valid,
+                      EstimateRandomEffects=FALSE)
+
+      actual <- inner_valid$DDpa
+
+      rmse <- sqrt(mean((actual-pred)^2,na.rm=TRUE))
+      mae <- mean(abs(actual-pred),na.rm=TRUE)
+      ss_total <- sum((actual-mean(actual,na.rm=TRUE))^2,na.rm=TRUE)
+      ss_res <- sum((actual-pred)^2,na.rm=TRUE)
+      r2 <- 1-ss_res/ss_total
+
+      c(RMSE=rmse,MAE=mae,R2=r2)
+    })
+
+    fold_results <- do.call(rbind, fold_results)
+
+    data.frame(
+      cp=params$cp,
+      minsplit=params$minsplit,
+      RMSE=mean(fold_results[,"RMSE"]),
+      MAE=mean(fold_results[,"MAE"]),
+      R2=mean(fold_results[,"R2"])
+    )
+  })
+
+  tune_results <- do.call(rbind,tune_results)
+
+  best <- tune_results[which.min(tune_results$RMSE),]
+
+  list(
+    best_hyperparameters=best[,c("cp","minsplit")],
+    tune_results=tune_results
+  )
+}
+```
+
+
+```{r}
+# Outer loop
+set.seed(1234)
+results <- lapply(seq_along(blocked_folds), function(outer_fold) { 
+  test_indices <- blocked_folds[[outer_fold]]
+  train_indices <- setdiff(seq_len(nrow(treedf_agg)), test_indices)
+  
+  train_data <- treedf_agg[train_indices, ]
+  test_data <- treedf_agg[test_indices, ]
+  
+  inner_results <- inner_loop(train_data)  
+  
+  best_tune <- inner_results$best_hyperparameters
+
+  final_model = REEMtree(
+      DDpa ~ 
+        DDanystr + DDanypos + DDanyemospt + DDphyact + DDslphour + DDanyphysymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+      random = ~ 1 | pid,
+      data = train_data,
+      tree.control = rpart.control(cp = best_tune$cp, minsplit = best_tune$minsplit),
+      correlation = corAR1(form = ~ DDday | pid)
+    )
+  
+  test_predictions <- predict(final_model, newdata = test_data, EstimateRandomEffects = FALSE)
+  
+  test_actual <- test_data$DDpa
+  test_rmse <- sqrt(mean((test_actual - test_predictions)^2, na.rm=TRUE))  # RMSE
+  test_mae <- mean(abs(test_actual - test_predictions), na.rm=TRUE)        # MAE
+  
+  ss_total <- sum((test_actual - mean(test_actual, na.rm=TRUE))^2, na.rm=TRUE)         # Total variance
+  ss_residual <- sum((test_actual - test_predictions)^2, na.rm=TRUE)       # Residual variance
+  out_of_sample_r2 <- 1 - (ss_residual / ss_total)             
+  
+  list(
+    outer_fold = outer_fold,
+    best_hyperparameters = best_tune,
+    test_rmse = test_rmse,
+    test_mae = test_mae,
+    out_of_sample_r2 = out_of_sample_r2
+  )
+})
+
+# Print results
+print(results)
+
+# Combine results
+results_df <- do.call(rbind, lapply(results, as.data.frame))
+print(results_df)
+```
+
+```{r}
+# Tune hyperparameters using the full dataset
+set.seed(1234)
+
+full_tuning <- inner_loop(treedf_agg)
+
+# Look at performance of each hyperparameter combination
+print(full_tuning$tune_results)
+
+# Select best hyperparameters for final model
+best_full <- full_tuning$best_hyperparameters
+print(best_full)
+```
+
+
+```{r}
+set.seed(1234)
+final_model = REEMtree::REEMtree(
+  DDpa ~ 
+    DDanystr + DDanypos + DDanyemospt + DDphyact + DDslphour + DDanyphysymp +
+    dep  + age + race_2g + collegegrad + female + DDwknd,
+  random = ~ 1 | pid,
+  data = treedf_agg,  # Use the entire dataset 
+  tree.control = rpart.control(cp = 0.001, minsplit = best_full$minsplit),
+   correlation = corAR1(form = ~ DDday | pid)
+)
+
+print(final_model)
+finaltree = final_model$Tree
+
+# Visualize the regression tree
+fancyRpartPlot(tree(final_model),
+               digits = 3,
+               sub="",
+               main="",
+               palettes=c("Greys", "Oranges"))
+```
+
+### Negative affect 
+
+
+```{r}
+# Inner loop Function
+inner_loop <- function(train_data){
+
+  grid <- expand.grid(
+    cp = 0.001,
+    minsplit = c(50,100, 200)
+  )
+
+  inner_folds <- create_blocked_folds(train_data, id_col="pid", k=5)
+
+  tune_results <- lapply(seq_len(nrow(grid)), function(i){
+
+    params <- grid[i,]
+
+    fold_results <- lapply(seq_along(inner_folds), function(fold){
+
+      valid_idx <- inner_folds[[fold]]
+      train_idx <- setdiff(seq_len(nrow(train_data)), valid_idx)
+
+      inner_train <- train_data[train_idx,]
+      inner_valid <- train_data[valid_idx,]
+
+      model <- REEMtree(
+        DDna ~ DDanystr + DDanypos + DDanyemospt + DDphyact +
+          DDslphour + DDanyphysymp +
+          dep + age + race_2g + collegegrad + female + DDwknd,
+        random = ~1|pid,
+        data = inner_train,
+        tree.control = rpart.control(cp=params$cp,
+                                     minsplit=params$minsplit),
+        correlation = corAR1()
+      )
+
+      pred <- predict(model,
+                      newdata=inner_valid,
+                      EstimateRandomEffects=FALSE)
+
+      actual <- inner_valid$DDna
+
+      rmse <- sqrt(mean((actual-pred)^2,na.rm=TRUE))
+      mae <- mean(abs(actual-pred),na.rm=TRUE)
+      ss_total <- sum((actual-mean(actual,na.rm=TRUE))^2,na.rm=TRUE)
+      ss_res <- sum((actual-pred)^2,na.rm=TRUE)
+      r2 <- 1-ss_res/ss_total
+
+      c(RMSE=rmse,MAE=mae,R2=r2)
+    })
+
+    fold_results <- do.call(rbind, fold_results)
+
+    data.frame(
+      cp=params$cp,
+      minsplit=params$minsplit,
+      RMSE=mean(fold_results[,"RMSE"]),
+      MAE=mean(fold_results[,"MAE"]),
+      R2=mean(fold_results[,"R2"])
+    )
+  })
+
+  tune_results <- do.call(rbind,tune_results)
+
+  best <- tune_results[which.min(tune_results$RMSE),]
+
+  list(
+    best_hyperparameters=best[,c("cp","minsplit")],
+    tune_results=tune_results
+  )
+}
+```
+
+
+```{r}
+# Outer loop
+set.seed(1234)
+results <- lapply(seq_along(blocked_folds), function(outer_fold) { 
+  test_indices <- blocked_folds[[outer_fold]]
+  train_indices <- setdiff(seq_len(nrow(treedf_agg)), test_indices)
+
+  train_data <- treedf_agg[train_indices, ]
+  test_data <- treedf_agg[test_indices, ]
+  
+  inner_results <- inner_loop(train_data) 
+  
+  best_tune <- inner_results$best_hyperparameters
+
+  
+  final_model = REEMtree(
+      DDna ~ 
+        DDanystr + DDanypos + DDanyemospt + DDphyact + DDslphour + DDanyphysymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+      random = ~ 1 | pid,
+      data = train_data,
+      tree.control = rpart.control(cp = best_tune$cp, minsplit = best_tune$minsplit),
+       correlation = corAR1(form = ~ DDday | pid)
+    )
+  
+  test_predictions <- predict(final_model, newdata = test_data, EstimateRandomEffects = FALSE)
+  
+  test_actual <- test_data$DDna
+  test_rmse <- sqrt(mean((test_actual - test_predictions)^2, na.rm=TRUE))  # RMSE
+  test_mae <- mean(abs(test_actual - test_predictions), na.rm=TRUE)        # MAE
+  
+  ss_total <- sum((test_actual - mean(test_actual, na.rm=TRUE))^2, na.rm=TRUE)         # Total variance
+  ss_residual <- sum((test_actual - test_predictions)^2, na.rm=TRUE)       # Residual variance
+  out_of_sample_r2 <- 1 - (ss_residual / ss_total)             
+  
+  list(
+    outer_fold = outer_fold,
+    best_hyperparameters = best_tune,
+    test_rmse = test_rmse,
+    test_mae = test_mae,
+    out_of_sample_r2 = out_of_sample_r2
+  )
+})
+
+# Print results
+print(results)
+
+# Combine results
+results_df <- do.call(rbind, lapply(results, as.data.frame))
+print(results_df)
+```
+
+
+```{r}
+# Tune hyperparameters using the full dataset
+set.seed(1234)
+
+full_tuning <- inner_loop(treedf_agg)
+
+# Look at performance of each hyperparameter combination
+print(full_tuning$tune_results)
+
+# Select best hyperparameters for final model
+best_full <- full_tuning$best_hyperparameters
+print(best_full)
+```
+
+
+```{r}
+set.seed(1234)
+final_model = REEMtree(
+  DDna ~ 
+    DDanystr + DDanypos + DDanyemospt + DDphyact + DDslphour + DDanyphysymp +
+    dep  + age + race_2g + collegegrad + female + DDwknd,
+  random = ~ 1 | pid,
+  data = treedf_agg,  # Use the entire dataset for final training
+  tree.control = rpart.control(cp = 0.001, minsplit = best_full$minsplit),
+   correlation = corAR1(form = ~ DDday | pid)
+)
+
+print(final_model)
+finaltree = final_model$Tree
+
+# Visualize the regression tree
+fancyRpartPlot(tree(final_model),
+               digits = 3,
+               sub="",
+               main="",
+               palettes=c("Greys", "Oranges"))
+
+```
+
+## Item-level models
+
+### Set up nested blocked CV
+
+```{r}
+create_blocked_folds <- function(data, id_col, k) {
+  ids <- unique(data[[id_col]])
+  folds <- caret::createFolds(ids, k = k, list = TRUE) 
+  id_folds <- lapply(folds, function(indices) ids[indices]) 
+  lapply(id_folds, function(ids_in_fold) { 
+  which(data[[id_col]] %in% as.numeric(ids_in_fold))  
+})
+}
+
+# Create blocked folds for individuals
+set.seed(123)
+blocked_folds = create_blocked_folds(treedf_item, id_col="pid", k = 5)
+```
+
+### positive affect model 
+
+```{r}
+# Inner loop Function
+inner_loop <- function(train_data){
+
+  grid <- expand.grid(
+    cp = 0.001,
+    minsplit = c(50,100, 200)
+  )
+
+  inner_folds <- create_blocked_folds(train_data, id_col="pid", k=5)
+
+  tune_results <- lapply(seq_len(nrow(grid)), function(i){
+
+    params <- grid[i,]
+
+    fold_results <- lapply(seq_along(inner_folds), function(fold){
+
+      valid_indices <- inner_folds[[fold]]
+      train_indices <- setdiff(seq_len(nrow(train_data)), valid_indices)
+
+      inner_train <- train_data[train_indices,]
+      inner_valid <- train_data[valid_indices,]
+
+      model <- REEMtree(
+        DDpa ~
+          DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim +
+          DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos +
+          DDnetpos + DDotherpos + DDgiveemospt + DDgetemospt +
+          DDphyact + DDslphour + DDpain + DDflu + DDgastro +
+          DDcirculatory + DDothersymp +
+          dep + age + race_2g + collegegrad + female + DDwknd,
+        random = ~1|pid,
+        data = inner_train,
+        tree.control = rpart.control(cp=params$cp, minsplit=params$minsplit),
+        correlation = corAR1()
+      )
+
+      predictions <- predict(model, newdata=inner_valid, EstimateRandomEffects=FALSE)
+      actuals <- inner_valid$DDpa
+
+      rmse <- sqrt(mean((actuals-predictions)^2, na.rm=TRUE))
+      mae <- mean(abs(actuals-predictions), na.rm=TRUE)
+      ss_total <- sum((actuals-mean(actuals, na.rm=TRUE))^2, na.rm=TRUE)
+      ss_residual <- sum((actuals-predictions)^2, na.rm=TRUE)
+      r2 <- 1-(ss_residual/ss_total)
+
+      c(RMSE=rmse, MAE=mae, R2=r2)
+    })
+
+    fold_results <- do.call(rbind, fold_results)
+
+    data.frame(
+      cp=params$cp,
+      minsplit=params$minsplit,
+      RMSE=mean(fold_results[,"RMSE"], na.rm=TRUE),
+      MAE=mean(fold_results[,"MAE"], na.rm=TRUE),
+      R2=mean(fold_results[,"R2"], na.rm=TRUE)
+    )
+  })
+
+  tune_results <- do.call(rbind, tune_results)
+
+  best_hyperparameters_rmse <- tune_results[which.min(tune_results$RMSE), c("cp","minsplit")]
+  best_hyperparameters_mae <- tune_results[which.min(tune_results$MAE), c("cp","minsplit")]
+  best_hyperparameters_r2 <- tune_results[which.max(tune_results$R2), c("cp","minsplit")]
+
+  list(
+    best_hyperparameters_rmse = best_hyperparameters_rmse,
+    best_hyperparameters_mae = best_hyperparameters_mae,
+    best_hyperparameters_r2 = best_hyperparameters_r2,
+    best_hyperparameters = best_hyperparameters_rmse,
+    tune_results = tune_results
+  )
+}
+```
+
+
+```{r}
+# Outer loop
+set.seed(1234)
+results <- lapply(seq_along(blocked_folds), function(outer_fold) { 
+  
+  test_indices <- blocked_folds[[outer_fold]]
+  train_indices <- setdiff(seq_len(nrow(treedf_item)), test_indices)
+
+  train_data <- treedf_item[train_indices, ]
+  test_data <- treedf_item[test_indices, ]
+  
+  inner_results <- inner_loop(train_data)  
+  
+  best_tune <- inner_results$best_hyperparameters
+
+  
+  final_model = REEMtree(
+      DDpa ~ 
+        DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim + DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos + DDnetpos + DDotherpos +
+        DDgiveemospt + DDgetemospt + DDphyact + DDslphour + DDpain + DDflu + DDgastro + DDcirculatory + DDothersymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+      random = ~ 1 | pid,
+      data = train_data,
+      tree.control = rpart.control(cp = best_tune$cp, minsplit = best_tune$minsplit),
+       correlation = corAR1(form = ~ DDday | pid)
+    )
+  
+  test_predictions <- predict(final_model, newdata = test_data, EstimateRandomEffects = FALSE)
+  
+  test_actual <- test_data$DDpa
+  test_rmse <- sqrt(mean((test_actual - test_predictions)^2, na.rm=TRUE))  # RMSE
+  test_mae <- mean(abs(test_actual - test_predictions), na.rm=TRUE)        # MAE
+  
+  ss_total <- sum((test_actual - mean(test_actual, na.rm=TRUE))^2, na.rm=TRUE)      # Total variance
+  ss_residual <- sum((test_actual - test_predictions)^2, na.rm=TRUE)       # Residual variance
+  out_of_sample_r2 <- 1 - (ss_residual / ss_total)             
+  
+  list(
+    outer_fold = outer_fold,
+    best_hyperparameters = best_tune,
+    test_rmse = test_rmse,
+    test_mae = test_mae,
+    out_of_sample_r2 = out_of_sample_r2
+  )
+})
+
+# Print results
+print(results)
+
+# Combine results
+results_df <- do.call(rbind, lapply(results, as.data.frame))
+print(results_df)
+```
+
+```{r}
+# Tune hyperparameters using the full dataset
+set.seed(1234)
+
+full_tuning <- inner_loop(treedf_item)
+
+# Look at performance of each hyperparameter combination
+print(full_tuning$tune_results)
+
+# Select best hyperparameters for final model
+best_full <- full_tuning$best_hyperparameters
+print(best_full)
+```
+
+```{r}
+set.seed(1234)
+final_model = REEMtree(
+  DDpa ~ 
+        DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim + DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos + DDnetpos + DDotherpos +
+        DDgiveemospt + DDgetemospt + DDphyact + DDslphour + DDpain + DDflu + DDgastro + DDcirculatory + DDothersymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+  random = ~ 1 | pid,
+  data = treedf_item,  
+  tree.control = rpart.control(cp = 0.001, minsplit = best_full$minsplit),
+   correlation = corAR1(form = ~ DDday | pid)
+)
+
+# Visualize the regression tree
+fancyRpartPlot(tree(final_model),
+               digits = 2,
+               sub="",
+               main="")
+```
+
+### Negative affect
+
+```{r}
+# Inner loop Function
+inner_loop <- function(train_data){
+
+  grid <- expand.grid(
+    cp = 0.001,
+    minsplit = c(50,100, 200)
+  )
+
+  inner_folds <- create_blocked_folds(train_data, id_col="pid", k=5)
+
+  tune_results <- lapply(seq_len(nrow(grid)), function(i){
+
+    params <- grid[i,]
+
+    fold_results <- lapply(seq_along(inner_folds), function(fold){
+
+      valid_indices <- inner_folds[[fold]]
+      train_indices <- setdiff(seq_len(nrow(train_data)), valid_indices)
+
+      inner_train <- train_data[train_indices,]
+      inner_valid <- train_data[valid_indices,]
+
+      model <- REEMtree(
+        DDna ~
+          DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim +
+          DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos +
+          DDnetpos + DDotherpos + DDgiveemospt + DDgetemospt +
+          DDphyact + DDslphour + DDpain + DDflu + DDgastro +
+          DDcirculatory + DDothersymp +
+          dep + age + race_2g + collegegrad + female + DDwknd,
+        random = ~1|pid,
+        data = inner_train,
+        tree.control = rpart.control(cp=params$cp, minsplit=params$minsplit),
+        correlation = corAR1()
+      )
+
+      predictions <- predict(model, newdata=inner_valid, EstimateRandomEffects=FALSE)
+      actuals <- inner_valid$DDna
+
+      rmse <- sqrt(mean((actuals-predictions)^2, na.rm=TRUE))
+      mae <- mean(abs(actuals-predictions), na.rm=TRUE)
+      ss_total <- sum((actuals-mean(actuals, na.rm=TRUE))^2, na.rm=TRUE)
+      ss_residual <- sum((actuals-predictions)^2, na.rm=TRUE)
+      r2 <- 1-(ss_residual/ss_total)
+
+      c(RMSE=rmse, MAE=mae, R2=r2)
+    })
+
+    fold_results <- do.call(rbind, fold_results)
+
+    data.frame(
+      cp=params$cp,
+      minsplit=params$minsplit,
+      RMSE=mean(fold_results[,"RMSE"], na.rm=TRUE),
+      MAE=mean(fold_results[,"MAE"], na.rm=TRUE),
+      R2=mean(fold_results[,"R2"], na.rm=TRUE)
+    )
+  })
+
+  tune_results <- do.call(rbind, tune_results)
+
+  best_hyperparameters_rmse <- tune_results[which.min(tune_results$RMSE), c("cp","minsplit")]
+  best_hyperparameters_mae <- tune_results[which.min(tune_results$MAE), c("cp","minsplit")]
+  best_hyperparameters_r2 <- tune_results[which.max(tune_results$R2), c("cp","minsplit")]
+
+  list(
+    best_hyperparameters_rmse = best_hyperparameters_rmse,
+    best_hyperparameters_mae = best_hyperparameters_mae,
+    best_hyperparameters_r2 = best_hyperparameters_r2,
+    best_hyperparameters = best_hyperparameters_rmse,
+    tune_results = tune_results
+  )
+}
+```
+
+
+```{r}
+# Outer loop
+set.seed(1234)
+results <- lapply(seq_along(blocked_folds), function(outer_fold) { 
+  
+  test_indices <- blocked_folds[[outer_fold]]
+  train_indices <- setdiff(seq_len(nrow(treedf_item)), test_indices)
+
+  train_data <- treedf_item[train_indices, ]
+  test_data <- treedf_item[test_indices, ]
+  
+  inner_results <- inner_loop(train_data) 
+  
+  best_tune <- inner_results$best_hyperparameters
+  
+  final_model = REEMtree(
+      DDna ~ 
+        DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim + DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos + DDnetpos + DDotherpos +
+        DDgiveemospt + DDgetemospt + DDphyact + DDslphour + DDpain + DDflu + DDgastro + DDcirculatory + DDothersymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+      random = ~ 1 | pid,
+      data = train_data,
+      tree.control = rpart.control(cp = best_tune$cp, minsplit = best_tune$minsplit),
+       correlation = corAR1(form = ~ DDday | pid)
+    )
+  
+  test_predictions <- predict(final_model, newdata = test_data, EstimateRandomEffects = FALSE)
+  
+  test_actual <- test_data$DDna
+  test_rmse <- sqrt(mean((test_actual - test_predictions)^2, na.rm=TRUE)) 
+  test_mae <- mean(abs(test_actual - test_predictions), na.rm=TRUE)        
+  ss_total <- sum((test_actual - mean(test_actual, na.rm=TRUE))^2, na.rm=TRUE)        
+  ss_residual <- sum((test_actual - test_predictions)^2, na.rm=TRUE)      
+  out_of_sample_r2 <- 1 - (ss_residual / ss_total)            
+  
+  list(
+    outer_fold = outer_fold,
+    best_hyperparameters = best_tune,
+    test_rmse = test_rmse,
+    test_mae = test_mae,
+    out_of_sample_r2 = out_of_sample_r2
+  )
+})
+
+# Print results
+print(results)
+
+# Combine results
+results_df <- do.call(rbind, lapply(results, as.data.frame))
+print(results_df)
+```
+
+```{r}
+# Tune hyperparameters using the full dataset
+set.seed(1234)
+
+full_tuning <- inner_loop(treedf_item)
+
+# Look at performance of each hyperparameter combination
+print(full_tuning$tune_results)
+
+# Select best hyperparameters for final model
+best_full <- full_tuning$best_hyperparameters
+print(best_full)
+```
+
+```{r}
+set.seed(1234)
+final_model = REEMtree(
+  DDna ~ 
+        DDarg + DDavoidarg + DDworkstr + DDhomestr + DDdiscrim + DDnetstr + DDotherstr + DDposint + DDworkpos + DDhomepos + DDnetpos + DDotherpos +
+        DDgiveemospt + DDgetemospt + DDphyact + DDslphour + DDpain + DDflu + DDgastro + DDcirculatory + DDothersymp +
+        dep  + age + race_2g + collegegrad + female + DDwknd,
+  random = ~ 1 | pid,
+  data = treedf_item,  
+  tree.control = rpart.control(cp = 0.001, minsplit = best_full$minsplit),
+   correlation = corAR1(form = ~ DDday | pid)
+)
+
+# Visualize the regression tree
+fancyRpartPlot(tree(final_model),
+               digits = 2,
+               sub="",
+               main="")
+```
